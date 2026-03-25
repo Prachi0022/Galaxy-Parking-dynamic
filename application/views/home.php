@@ -253,6 +253,7 @@
       				</div>
       			</div>
       		</section>
+			<?php $this->load->view('component/map'); ?>
 
       		<?php $this->load->view('component/journey'); ?>
 
