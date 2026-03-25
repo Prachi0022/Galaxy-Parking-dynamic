@@ -1152,6 +1152,332 @@ const parkingLocationsByCountry = {
     ]
 };
 
+const AUTO_ROTATE_INTERVAL_MS = 80;
+const AUTO_ROTATE_STEP_DEGREES = 0.35;
+const AUTO_ROTATE_RESUME_ZOOM_TOLERANCE = 0.05;
+const INITIAL_GLOBE_ROTATION = [60, -30];
+const DRAG_ROTATE_DEGREES_PER_PIXEL = 0.2;
+const MAX_LATITUDE_ROTATION = 85;
+
+const normalizeLongitude = longitude => ((longitude % 360) + 360) % 360;
+const clampLatitude = latitude => Math.max(-MAX_LATITUDE_ROTATION, Math.min(MAX_LATITUDE_ROTATION, latitude));
+
+const getChartZoom = chart => (
+    chart.mapView && typeof chart.mapView.zoom === 'number' ? chart.mapView.zoom : 0
+);
+
+const getChartMinZoom = chart => (
+    chart.mapView && typeof chart.mapView.minZoom === 'number' ? chart.mapView.minZoom : 0
+);
+
+const isFullyZoomedOut = chart => (
+    getChartZoom(chart) <= (getChartMinZoom(chart) + AUTO_ROTATE_RESUME_ZOOM_TOLERANCE)
+);
+
+const stopAutoRotation = chart => {
+    if (chart.autoRotateTimer) {
+        clearInterval(chart.autoRotateTimer);
+        chart.autoRotateTimer = null;
+    }
+};
+
+const startAutoRotation = chart => {
+    if (chart.autoRotateTimer) {
+        return;
+    }
+
+    if (chart.autoRotationStoppedByCountrySelection && !isFullyZoomedOut(chart)) {
+        return;
+    }
+
+    if (typeof chart.autoRotateLongitude !== 'number') {
+        chart.autoRotateLongitude = INITIAL_GLOBE_ROTATION[0];
+    }
+
+    if (typeof chart.lockedLatitude !== 'number') {
+        chart.lockedLatitude = INITIAL_GLOBE_ROTATION[1];
+    }
+
+    chart.autoRotateTimer = setInterval(() => {
+        if (!chart.mapView || chart.isDestroyed) {
+            return;
+        }
+
+        chart.autoRotateLongitude = normalizeLongitude(chart.autoRotateLongitude + AUTO_ROTATE_STEP_DEGREES);
+
+        chart.mapView.update({
+            projection: {
+                name: 'Orthographic',
+                rotation: [chart.autoRotateLongitude, chart.lockedLatitude]
+            }
+        }, false);
+        chart.redraw(false);
+    }, AUTO_ROTATE_INTERVAL_MS);
+};
+
+const syncAutoRotationWithZoom = chart => {
+    if (chart.autoRotationStoppedByCountrySelection && isFullyZoomedOut(chart)) {
+        chart.autoRotationStoppedByCountrySelection = false;
+        startAutoRotation(chart);
+    }
+};
+
+const syncGlobeRotationState = chart => {
+    if (!chart.mapView) {
+        return;
+    }
+
+    const rotation = (
+        chart.mapView.projection && chart.mapView.projection.options && chart.mapView.projection.options.rotation
+    ) || INITIAL_GLOBE_ROTATION;
+
+    const longitude = typeof rotation[0] === 'number' ? rotation[0] : INITIAL_GLOBE_ROTATION[0];
+    const latitude = typeof rotation[1] === 'number' ? rotation[1] : INITIAL_GLOBE_ROTATION[1];
+
+    chart.autoRotateLongitude = longitude;
+    chart.lockedLatitude = clampLatitude(latitude);
+};
+
+const attachHorizontalDragRotation = chart => {
+    if (isTouchDevice) {
+        return () => {};
+    }
+
+    let pointerActive = false;
+    let startX = 0;
+    let startY = 0;
+    let startLongitude = INITIAL_GLOBE_ROTATION[0];
+    let startLatitude = INITIAL_GLOBE_ROTATION[1];
+
+    const onPointerDown = event => {
+        if (event.button !== 0) {
+            return;
+        }
+
+        pointerActive = true;
+        startX = event.clientX;
+        startY = event.clientY;
+        const rotation = (
+            chart.mapView && chart.mapView.projection && chart.mapView.projection.options && chart.mapView.projection.options.rotation
+        ) || INITIAL_GLOBE_ROTATION;
+        startLongitude = typeof rotation[0] === 'number' ? rotation[0] : INITIAL_GLOBE_ROTATION[0];
+        startLatitude = typeof rotation[1] === 'number' ? rotation[1] : INITIAL_GLOBE_ROTATION[1];
+        chart.autoRotateLongitude = startLongitude;
+        chart.lockedLatitude = clampLatitude(startLatitude);
+        stopAutoRotation(chart);
+    };
+
+    const onPointerMove = event => {
+        if (!pointerActive || !chart.mapView) {
+            return;
+        }
+
+        const deltaX = event.clientX - startX;
+        const deltaY = event.clientY - startY;
+        const nextLongitude = normalizeLongitude(startLongitude + (deltaX * DRAG_ROTATE_DEGREES_PER_PIXEL));
+        const nextLatitude = clampLatitude(startLatitude - (deltaY * DRAG_ROTATE_DEGREES_PER_PIXEL));
+
+        chart.autoRotateLongitude = nextLongitude;
+        chart.lockedLatitude = nextLatitude;
+        chart.mapView.update({
+            projection: {
+                name: 'Orthographic',
+                rotation: [nextLongitude, nextLatitude]
+            }
+        }, false);
+        chart.redraw(false);
+        event.preventDefault();
+    };
+
+    const onPointerUp = () => {
+        if (!pointerActive) {
+            return;
+        }
+
+        pointerActive = false;
+        if (!chart.autoRotationStoppedByCountrySelection) {
+            startAutoRotation(chart);
+        }
+    };
+
+    chart.container.addEventListener('pointerdown', onPointerDown);
+    chart.container.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointercancel', onPointerUp);
+
+    return () => {
+        chart.container.removeEventListener('pointerdown', onPointerDown);
+        chart.container.removeEventListener('pointermove', onPointerMove);
+        window.removeEventListener('pointerup', onPointerUp);
+        window.removeEventListener('pointercancel', onPointerUp);
+    };
+};
+
+const attachDoubleClickZoomBehavior = (chart, countrySeriesName) => {
+    const getLonLatFromEvent = event => {
+        if (!chart.mapView || typeof chart.mapView.pixelsToLonLat !== 'function') {
+            return null;
+        }
+
+        const normalizedEvent = chart.pointer && typeof chart.pointer.normalize === 'function'
+            ? chart.pointer.normalize(event)
+            : null;
+
+        const pixelPosition = normalizedEvent && Number.isFinite(normalizedEvent.chartX) && Number.isFinite(normalizedEvent.chartY)
+            ? { x: normalizedEvent.chartX, y: normalizedEvent.chartY }
+            : (() => {
+                const rect = chart.container.getBoundingClientRect();
+                return {
+                    x: event.clientX - rect.left,
+                    y: event.clientY - rect.top
+                };
+            })();
+
+        const lonLat = chart.mapView.pixelsToLonLat(pixelPosition);
+        if (
+            lonLat &&
+            Number.isFinite(lonLat.lon) &&
+            Number.isFinite(lonLat.lat)
+        ) {
+            return lonLat;
+        }
+
+        return null;
+    };
+
+    const getPointCenterLonLat = point => {
+        const properties = point && point.properties ? point.properties : {};
+        const middleLon = Number(properties['hc-middle-lon']);
+        const middleLat = Number(properties['hc-middle-lat']);
+
+        if (Number.isFinite(middleLon) && Number.isFinite(middleLat)) {
+            return { lon: middleLon, lat: middleLat };
+        }
+
+        const geometry = point && point.geometry ? point.geometry : null;
+        if (!geometry || !geometry.coordinates) {
+            return null;
+        }
+
+        const lonLatPairs = [];
+        const collectPairs = coordinates => {
+            if (!Array.isArray(coordinates)) {
+                return;
+            }
+
+            if (
+                coordinates.length >= 2 &&
+                typeof coordinates[0] === 'number' &&
+                typeof coordinates[1] === 'number'
+            ) {
+                lonLatPairs.push([coordinates[0], coordinates[1]]);
+                return;
+            }
+
+            coordinates.forEach(collectPairs);
+        };
+
+        collectPairs(geometry.coordinates);
+
+        if (!lonLatPairs.length) {
+            return null;
+        }
+
+        let minLon = lonLatPairs[0][0];
+        let maxLon = lonLatPairs[0][0];
+        let minLat = lonLatPairs[0][1];
+        let maxLat = lonLatPairs[0][1];
+
+        lonLatPairs.forEach(pair => {
+            minLon = Math.min(minLon, pair[0]);
+            maxLon = Math.max(maxLon, pair[0]);
+            minLat = Math.min(minLat, pair[1]);
+            maxLat = Math.max(maxLat, pair[1]);
+        });
+
+        return {
+            lon: (minLon + maxLon) / 2,
+            lat: (minLat + maxLat) / 2
+        };
+    };
+
+    const resolveCountryPointFromEvent = event => {
+        let targetElement = event.target;
+
+        while (targetElement && targetElement !== chart.container) {
+            const point = targetElement.point;
+            if (
+                point &&
+                point.series &&
+                point.series.name === countrySeriesName &&
+                point.geometry
+            ) {
+                return point;
+            }
+            targetElement = targetElement.parentNode;
+        }
+
+        const hoverPoint = chart.hoverPoint;
+        if (
+            hoverPoint &&
+            hoverPoint.series &&
+            hoverPoint.series.name === countrySeriesName &&
+            hoverPoint.geometry
+        ) {
+            return hoverPoint;
+        }
+
+        return null;
+    };
+
+    const handleDoubleClick = event => {
+        event.preventDefault();
+
+        if (!chart.mapView || typeof chart.mapView.zoomBy !== 'function') {
+            return;
+        }
+
+        const targetPoint = resolveCountryPointFromEvent(event);
+
+        if (targetPoint) {
+            chart.autoRotationStoppedByCountrySelection = true;
+            stopAutoRotation(chart);
+            const clickedLonLat = getLonLatFromEvent(event);
+            const center = clickedLonLat || getPointCenterLonLat(targetPoint);
+            if (center) {
+                const targetLongitude = normalizeLongitude(-center.lon);
+                const targetLatitude = clampLatitude(-center.lat);
+
+                chart.autoRotateLongitude = targetLongitude;
+                chart.lockedLatitude = targetLatitude;
+
+                chart.mapView.update({
+                    projection: {
+                        name: 'Orthographic',
+                        rotation: [targetLongitude, targetLatitude]
+                    }
+                }, false);
+
+                chart.mapView.zoomBy(0.9, [center.lon, center.lat]);
+                chart.redraw(false);
+                return;
+            }
+
+            chart.mapView.zoomBy(0.9);
+            chart.redraw(false);
+            return;
+        }
+
+        chart.mapView.zoomBy(-0.7);
+    };
+
+    chart.container.addEventListener('dblclick', handleDoubleClick);
+
+    return () => {
+        chart.container.removeEventListener('dblclick', handleDoubleClick);
+    };
+};
+
 const showParkingLocations = (chart, countryName) => {
     const parkingLocations = parkingLocationsByCountry[countryName] || [];
     const existingSeries = chart.get('parking-locations');
@@ -1288,7 +1614,7 @@ const topology = await fetchJsonFromFallbackUrls(topologyUrls);
         const chart = Highcharts.mapChart('container', {
             chart: {
                 map: topology,
-                panning: !isTouchDevice
+                panning: false
             },
 
             accessibility: {
@@ -1320,7 +1646,8 @@ const topology = await fetchJsonFromFallbackUrls(topologyUrls);
                 enabled: !isTouchDevice,
                 enableTouchZoom: false,
                 enableMouseWheelZoom: false,
-                enableDoubleClickZoomTo: true,
+                enableDoubleClickZoom: false,
+                enableDoubleClickZoomTo: false,
                 buttonOptions: {
                     verticalAlign: 'bottom'
                 }
@@ -1330,7 +1657,7 @@ const topology = await fetchJsonFromFallbackUrls(topologyUrls);
                 maxZoom: 30,
                 projection: {
                     name: 'Orthographic',
-                    rotation: [60, -30]
+                    rotation: INITIAL_GLOBE_ROTATION
                 }
             },
 
@@ -1387,7 +1714,10 @@ const topology = await fetchJsonFromFallbackUrls(topologyUrls);
                 point: {
                     events: {
                         click: function () {
-                            showParkingLocations(this.series.chart, this.name);
+                            const chart = this.series.chart;
+                            chart.autoRotationStoppedByCountrySelection = true;
+                            stopAutoRotation(chart);
+                            showParkingLocations(chart, this.name);
                         }
                     }
                 },
@@ -1438,8 +1768,27 @@ const topology = await fetchJsonFromFallbackUrls(topologyUrls);
             });
         };
         renderSea();
+        chart.autoRotationStoppedByCountrySelection = false;
+        chart.autoRotateTimer = null;
+        chart.autoRotateLongitude = INITIAL_GLOBE_ROTATION[0];
+        chart.lockedLatitude = INITIAL_GLOBE_ROTATION[1];
+        const detachHorizontalDragRotation = attachHorizontalDragRotation(chart);
+        const detachDoubleClickZoomBehavior = attachDoubleClickZoomBehavior(
+            chart,
+            'Airports per million km²'
+        );
+
+        startAutoRotation(chart);
+
         Highcharts.addEvent(chart, 'redraw', renderSea);
+        Highcharts.addEvent(chart, 'redraw', () => syncGlobeRotationState(chart));
         Highcharts.addEvent(chart, 'redraw', () => syncParkingVisibilityWithZoom(chart));
+        Highcharts.addEvent(chart, 'redraw', () => syncAutoRotationWithZoom(chart));
+        Highcharts.addEvent(chart, 'destroy', () => {
+            stopAutoRotation(chart);
+            detachHorizontalDragRotation();
+            detachDoubleClickZoomBehavior();
+        });
 };
 
 const startMap = async () => {
